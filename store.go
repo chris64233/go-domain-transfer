@@ -1,0 +1,170 @@
+package domaintransfer
+
+import (
+	"encoding/json"
+	"errors"
+	"io/fs"
+	"os"
+	"sync"
+)
+
+// Persister 抽象持久化介质。Save 必须原子生效（全部写入或完全不写）。
+type Persister interface {
+	Save(snapshot []byte) error
+	Load() ([]byte, error)
+}
+
+// FilePersister 以 JSON 快照持久化到本地文件，通过临时文件 + rename 保证原子写。
+type FilePersister struct{ path string }
+
+// NewFilePersister 创建文件持久化器。
+func NewFilePersister(path string) *FilePersister { return &FilePersister{path: path} }
+
+// Save 原子写入快照。
+func (p *FilePersister) Save(data []byte) error {
+	tmp := p.path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, p.path)
+}
+
+// Load 读取快照；文件不存在时返回 nil, nil。
+func (p *FilePersister) Load() ([]byte, error) {
+	b, err := os.ReadFile(p.path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	return b, err
+}
+
+// state 是全部可持久化状态。AuthCodes 以摘要为键。
+type state struct {
+	Domains         map[string]*Domain         `json:"domains"`
+	AuthCodes       map[string]*AuthCodeRecord `json:"auth_codes"`
+	Transfers       map[string]*Transfer       `json:"transfers"`
+	TransferByRef   map[string]string          `json:"transfer_by_ref"` // externalRef -> transferID
+	PendingByDomain map[string]string          `json:"pending_by_domain"`
+	Outbox          map[string]*OutboxMessage  `json:"outbox"`
+	Audit           []AuditEntry               `json:"audit"`
+	Seq             int64                      `json:"seq"`
+}
+
+func newState() *state {
+	return &state{
+		Domains:         map[string]*Domain{},
+		AuthCodes:       map[string]*AuthCodeRecord{},
+		Transfers:       map[string]*Transfer{},
+		TransferByRef:   map[string]string{},
+		PendingByDomain: map[string]string{},
+		Outbox:          map[string]*OutboxMessage{},
+	}
+}
+
+// clone 深拷贝整个状态，用于 clone-and-swap 事务。
+func (s *state) clone() *state {
+	c := &state{
+		Domains:         make(map[string]*Domain, len(s.Domains)),
+		AuthCodes:       make(map[string]*AuthCodeRecord, len(s.AuthCodes)),
+		Transfers:       make(map[string]*Transfer, len(s.Transfers)),
+		TransferByRef:   make(map[string]string, len(s.TransferByRef)),
+		PendingByDomain: make(map[string]string, len(s.PendingByDomain)),
+		Outbox:          make(map[string]*OutboxMessage, len(s.Outbox)),
+		Audit:           make([]AuditEntry, len(s.Audit)),
+		Seq:             s.Seq,
+	}
+	for k, v := range s.Domains {
+		d := *v
+		c.Domains[k] = &d
+	}
+	for k, v := range s.AuthCodes {
+		r := *v
+		if v.ConsumedAt != nil {
+			t := *v.ConsumedAt
+			r.ConsumedAt = &t
+		}
+		c.AuthCodes[k] = &r
+	}
+	for k, v := range s.Transfers {
+		t := *v
+		if v.DecidedAt != nil {
+			d := *v.DecidedAt
+			t.DecidedAt = &d
+		}
+		c.Transfers[k] = &t
+	}
+	for k, v := range s.TransferByRef {
+		c.TransferByRef[k] = v
+	}
+	for k, v := range s.PendingByDomain {
+		c.PendingByDomain[k] = v
+	}
+	for k, v := range s.Outbox {
+		m := *v
+		c.Outbox[k] = &m
+	}
+	copy(c.Audit, s.Audit)
+	return c
+}
+
+// Store 持有全部状态，以单互斥锁 + clone-and-swap 提供原子事务边界：
+// 事务函数在副本上修改，持久化成功后才整体换入；任何失败都不会留下中间状态。
+type Store struct {
+	mu        sync.Mutex
+	st        *state
+	persister Persister // 可为 nil（纯内存）
+}
+
+// NewStore 创建 Store；若 persister 非 nil 且已有快照则加载恢复。
+func NewStore(persister Persister) (*Store, error) {
+	st := newState()
+	if persister != nil {
+		data, err := persister.Load()
+		if err != nil {
+			return nil, err
+		}
+		if len(data) > 0 {
+			if err := json.Unmarshal(data, st); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return &Store{st: st, persister: persister}, nil
+}
+
+// transact 在原子边界内执行 fn：先在状态副本上应用变更，再持久化，
+// 全部成功才提交换入；任一步失败，已提交状态不受影响。
+func (s *Store) transact(fn func(st *state) error) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	next := s.st.clone()
+	if err := fn(next); err != nil {
+		return err
+	}
+	if s.persister != nil {
+		data, err := json.Marshal(next)
+		if err != nil {
+			return err
+		}
+		if err := s.persister.Save(data); err != nil {
+			return err
+		}
+	}
+	s.st = next
+	return nil
+}
+
+// view 在锁内执行只读函数。实现方必须返回拷贝，不得泄露内部指针。
+func (s *Store) view(fn func(st *state)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	fn(s.st)
+}
+
+// snapshotJSON 导出当前状态快照（测试与调试用途）。
+func (s *Store) snapshotJSON() ([]byte, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return json.Marshal(s.st)
+}
