@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"strconv"
 	"time"
 )
 
@@ -19,12 +20,24 @@ const (
 	TimeoutAutoReject
 )
 
+// ContactConfig 是域名的联系人审批配置。空 RequiredRoles 表示不设联系人门槛。
+// 联系人资料本身（Contact）可随时更新；进行中的转移使用创建时冻结的快照。
+type ContactConfig struct {
+	AdminContactID string
+	TechContactID  string
+	// RequiredRoles 为发起转移所需的角色组合；角色去重后按固定顺序冻结。
+	RequiredRoles []ContactRole
+	// DecisionWindow 为每轮联系人审批有效期；0 表示使用服务默认值。
+	DecisionWindow time.Duration
+}
+
 // Service 提供域名转移的全部业务操作。所有方法并发安全。
 type Service struct {
 	store          *Store
 	now            func() time.Time
 	decisionWindow time.Duration
 	maxCodeTTL     time.Duration
+	contactWindow  time.Duration
 	timeoutPolicy  TimeoutPolicy
 	err            error // Option 构造期的延迟错误
 }
@@ -73,12 +86,18 @@ func WithTimeoutPolicy(p TimeoutPolicy) Option {
 	return func(s *Service) { s.timeoutPolicy = p }
 }
 
+// WithContactDecisionWindow 设置每轮联系人审批的默认有效期。
+func WithContactDecisionWindow(d time.Duration) Option {
+	return func(s *Service) { s.contactWindow = d }
+}
+
 // NewService 创建服务。
 func NewService(opts ...Option) (*Service, error) {
 	s := &Service{
 		now:            time.Now,
 		decisionWindow: 5 * 24 * time.Hour, // 惯例 5 天
 		maxCodeTTL:     24 * time.Hour,
+		contactWindow:  7 * 24 * time.Hour, // 联系人每轮审批默认 7 天
 		timeoutPolicy:  TimeoutAutoApprove,
 	}
 	for _, opt := range opts {
@@ -94,10 +113,176 @@ func NewService(opts ...Option) (*Service, error) {
 		}
 		s.store = st
 	}
-	if s.decisionWindow <= 0 || s.maxCodeTTL <= 0 {
-		return nil, fmt.Errorf("%w: decision window and max code TTL must be positive", ErrInvalidInput)
+	if s.decisionWindow <= 0 || s.maxCodeTTL <= 0 || s.contactWindow <= 0 {
+		return nil, fmt.Errorf("%w: decision windows and max code TTL must be positive", ErrInvalidInput)
 	}
 	return s, nil
+}
+
+// RegisterContact 登记联系人资料。不含任何凭据字段。
+func (s *Service) RegisterContact(id, name, email string) error {
+	if id == "" || name == "" || email == "" {
+		return fmt.Errorf("%w: contact id, name and email are required", ErrInvalidInput)
+	}
+	return s.store.transact(func(st *state) error {
+		if _, ok := st.Contacts[id]; ok {
+			return ErrContactExists
+		}
+		st.Contacts[id] = &Contact{ID: id, Name: name, Email: email}
+		return nil
+	})
+}
+
+// GetContact 查询联系人资料。
+func (s *Service) GetContact(id string) (*Contact, error) {
+	var out *Contact
+	s.store.view(func(st *state) {
+		if c, ok := st.Contacts[id]; ok {
+			cp := *c
+			out = &cp
+		}
+	})
+	if out == nil {
+		return nil, ErrContactNotFound
+	}
+	return out, nil
+}
+
+// UpdateContact 更新联系人资料。只影响之后冻结的策略；
+// 进行中转移持有的冻结快照不变（门槛不会被悄悄改变）。
+func (s *Service) UpdateContact(id, name, email string) error {
+	if id == "" || name == "" || email == "" {
+		return fmt.Errorf("%w: contact id, name and email are required", ErrInvalidInput)
+	}
+	return s.store.transact(func(st *state) error {
+		c, ok := st.Contacts[id]
+		if !ok {
+			return ErrContactNotFound
+		}
+		c.Name = name
+		c.Email = email
+		return nil
+	})
+}
+
+// ConfigureDomainContacts 设置域名的管理/技术联系人与转移所需角色组合。
+// 仅域名所有者可改；仅影响之后创建的转移，进行中的转移使用冻结快照，不受影响。
+// cfg.RequiredRoles 为空时清除联系人门槛。
+func (s *Service) ConfigureDomainContacts(domain, ownerID string, cfg ContactConfig) error {
+	if domain == "" || ownerID == "" {
+		return fmt.Errorf("%w: domain and owner are required", ErrInvalidInput)
+	}
+	roles, err := normalizeRoles(cfg.RequiredRoles)
+	if err != nil {
+		return err
+	}
+	if cfg.DecisionWindow < 0 {
+		return fmt.Errorf("%w: contact decision window must not be negative", ErrInvalidInput)
+	}
+	return s.store.transact(func(st *state) error {
+		d, ok := st.Domains[domain]
+		if !ok {
+			return ErrDomainNotFound
+		}
+		if d.OwnerID != ownerID {
+			return ErrNotDomainOwner
+		}
+		// 所需角色必须绑定已登记的联系人。
+		for _, role := range roles {
+			contactID := cfg.AdminContactID
+			if role == RoleTech {
+				contactID = cfg.TechContactID
+			}
+			if contactID == "" {
+				return fmt.Errorf("%w: role %s requires a contact", ErrInvalidInput, role)
+			}
+			if _, ok := st.Contacts[contactID]; !ok {
+				return ErrContactNotFound
+			}
+		}
+		d.AdminContactID = cfg.AdminContactID
+		d.TechContactID = cfg.TechContactID
+		d.RequiredRoles = roles
+		d.ContactDecisionWindow = cfg.DecisionWindow
+		d.Version++
+		appendAudit(st, s.now(), "domain_contacts_configured", domain, "", d.OwnerID,
+			"required_roles="+rolesString(roles))
+		return nil
+	})
+}
+
+// normalizeRoles 校验、去重并固定角色顺序（admin 在 tech 之前），
+// 使冻结策略的角色组合具有确定表示。
+func normalizeRoles(roles []ContactRole) ([]ContactRole, error) {
+	seen := map[ContactRole]bool{}
+	for _, r := range roles {
+		if !r.Valid() {
+			return nil, fmt.Errorf("%w: unsupported contact role %q", ErrInvalidInput, r)
+		}
+		seen[r] = true
+	}
+	if len(seen) == 0 {
+		return nil, nil
+	}
+	out := make([]ContactRole, 0, len(seen))
+	if seen[RoleAdmin] {
+		out = append(out, RoleAdmin)
+	}
+	if seen[RoleTech] {
+		out = append(out, RoleTech)
+	}
+	return out, nil
+}
+
+func rolesString(roles []ContactRole) string {
+	if len(roles) == 0 {
+		return "none"
+	}
+	out := ""
+	for i, r := range roles {
+		if i > 0 {
+			out += ","
+		}
+		out += string(r)
+	}
+	return out
+}
+
+// freezePolicy 在转移创建时冻结联系人与审批策略快照。
+// 调用方须持有事务并已完成角色归一化。
+func (s *Service) freezePolicy(st *state, d *Domain, now time.Time) (*FrozenApprovalPolicy, error) {
+	roles, err := normalizeRoles(d.RequiredRoles)
+	if err != nil {
+		return nil, err
+	}
+	if len(roles) == 0 {
+		return nil, nil
+	}
+	window := d.ContactDecisionWindow
+	if window <= 0 {
+		window = s.contactWindow
+	}
+	p := &FrozenApprovalPolicy{
+		RequiredRoles:         roles,
+		ContactDecisionWindow: window,
+	}
+	for _, role := range roles {
+		contactID := d.AdminContactID
+		if role == RoleTech {
+			contactID = d.TechContactID
+		}
+		c, ok := st.Contacts[contactID]
+		if !ok {
+			return nil, ErrContactNotFound
+		}
+		p.Contacts = append(p.Contacts, FrozenContact{
+			ContactID: c.ID,
+			Role:      role,
+			Name:      c.Name,
+			Email:     c.Email,
+		})
+	}
+	return p, nil
 }
 
 // RegisterDomain 登记域名（初始化/迁入数据用）。
@@ -178,8 +363,7 @@ func (s *Service) InitiateTransfer(externalRef, domain, code, actor string) (*Tr
 			rec, rok := st.AuthCodes[digest]
 			if t.Domain == domain && rok &&
 				t.ToRegistrar == rec.TargetRegistrar && t.ToOwnerID == rec.TargetOwnerID {
-				cp := *t
-				result = &cp
+				result = cloneTransfer(t)
 				return nil
 			}
 			return ErrTransferConflict
@@ -206,12 +390,16 @@ func (s *Service) InitiateTransfer(externalRef, domain, code, actor string) (*Tr
 			return ErrAuthCodeExpired
 		}
 
-		// 同一原子边界：消费授权码 + 锁定域名 + 创建转移单。
+		// 同一原子边界：消费授权码 + 锁定域名 + 创建转移单（含冻结策略）。
 		consumed := now
 		rec.ConsumedAt = &consumed
 		d.Locked = true
 		d.Version++
 
+		policy, err := s.freezePolicy(st, d, now)
+		if err != nil {
+			return err
+		}
 		t := &Transfer{
 			ID:            newTransferID(st),
 			ExternalRef:   externalRef,
@@ -222,14 +410,22 @@ func (s *Service) InitiateTransfer(externalRef, domain, code, actor string) (*Tr
 			ToOwnerID:     rec.TargetOwnerID,
 			Status:        StatusPending,
 			CreatedAt:     now,
-			Deadline:      now.Add(s.decisionWindow),
+			Policy:        policy,
+		}
+		if policy != nil {
+			// 联系人门槛阶段：注册商决定期限此时尚未起算。
+			t.Phase = PhaseContacts
+			t.Rounds = []*ContactRound{newContactRound(1, now, policy.ContactDecisionWindow)}
+		} else {
+			// 无联系人门槛：直接进入注册商阶段，保持历史语义。
+			t.Phase = PhaseRegistrar
+			t.Deadline = now.Add(s.decisionWindow)
 		}
 		st.Transfers[t.ID] = t
 		st.TransferByRef[externalRef] = t.ID
 		st.PendingByDomain[domain] = t.ID
 		appendAudit(st, now, "transfer_initiated", domain, t.ID, actor, "to_registrar="+t.ToRegistrar)
-		cp := *t
-		result = &cp
+		result = cloneTransfer(t)
 		return nil
 	})
 	if err != nil {
@@ -239,6 +435,7 @@ func (s *Service) InitiateTransfer(externalRef, domain, code, actor string) (*Tr
 }
 
 // Decide 由原注册商在决定期限内批准或拒绝。
+// 联系人门槛达成前注册商决定期限不起算，此时返回 ErrAwaitingContacts。
 // 终态不可逆：已终态的转移返回 ErrTransferNotPending，迟到回调不得覆盖。
 func (s *Service) Decide(transferID, registrar string, approve bool, reason string) (*Transfer, error) {
 	if transferID == "" || registrar == "" {
@@ -257,6 +454,9 @@ func (s *Service) Decide(transferID, registrar string, approve bool, reason stri
 		if registrar != t.FromRegistrar {
 			return ErrForbidden
 		}
+		if t.Phase != PhaseRegistrar {
+			return ErrAwaitingContacts
+		}
 		if now.After(t.Deadline) {
 			return ErrDecisionWindowLapsed
 		}
@@ -265,8 +465,7 @@ func (s *Service) Decide(transferID, registrar string, approve bool, reason stri
 		} else {
 			rejectLocked(st, t, now, StatusRejected, registrar, reason)
 		}
-		cp := *t
-		result = &cp
+		result = cloneTransfer(t)
 		return nil
 	})
 	if err != nil {
@@ -299,8 +498,7 @@ func (s *Service) Cancel(transferID, actor string) (*Transfer, error) {
 		t.DecidedBy = actor
 		emitOutbox(st, t, now, "transfer.cancelled")
 		appendAudit(st, now, "transfer_cancelled", t.Domain, t.ID, actor, "")
-		cp := *t
-		result = &cp
+		result = cloneTransfer(t)
 		return nil
 	})
 	if err != nil {
@@ -321,7 +519,7 @@ func (s *Service) AdvanceTimeouts() (int, error) {
 		}
 		for _, id := range ids {
 			t := st.Transfers[id]
-			if t == nil || t.Status != StatusPending || !now.After(t.Deadline) {
+			if t == nil || t.Status != StatusPending || t.Phase != PhaseRegistrar || !now.After(t.Deadline) {
 				continue
 			}
 			switch s.timeoutPolicy {
@@ -337,13 +535,241 @@ func (s *Service) AdvanceTimeouts() (int, error) {
 	return count, err
 }
 
-// GetTransfer 按内部 ID 查询转移单。
+// ContactDecide 记录联系人的唯一决定事件。
+// eventID 是幂等键：同一事件相同内容（轮次/联系人/角色/同意与否）幂等返回，
+// 同号异内容返回 ErrContactDecisionConflict。
+// 决定必须匹配转移、联系人及其冻结角色；旧轮次的迟到决定返回 ErrStaleRound，
+// 不得推进当前转移。任一所需联系人明确拒绝，转移立即以 rejected 终局，
+// 此后其他同意或超时规则都不能再批准该转移。
+func (s *Service) ContactDecide(transferID, eventID string, round int, contactID string, role ContactRole, approve bool, reason string) (*Transfer, error) {
+	if transferID == "" || eventID == "" || contactID == "" || !role.Valid() {
+		return nil, fmt.Errorf("%w: transfer id, event id, contact id and valid role are required", ErrInvalidInput)
+	}
+	now := s.now()
+	var result *Transfer
+	err := s.store.transact(func(st *state) error {
+		t, ok := st.Transfers[transferID]
+		if !ok {
+			return ErrTransferNotFound
+		}
+
+		// 幂等优先：事件号已在任意轮次出现时，按内容判重（reason 不参与）。
+		if d, ok := findDecision(t, eventID); ok {
+			if d.Round == round && d.ContactID == contactID && d.Role == role && d.Approve == approve {
+				result = cloneTransfer(t)
+				return nil
+			}
+			return ErrContactDecisionConflict
+		}
+
+		if t.Status.Terminal() {
+			return ErrTransferNotPending
+		}
+		if t.Phase != PhaseContacts || t.Policy == nil {
+			return ErrContactApprovalClosed
+		}
+		cur := t.CurrentRound()
+		if round < cur.Number {
+			// 旧轮次迟到决定：记录但绝不推进——这里直接拒绝，不写入当前轮。
+			return ErrStaleRound
+		}
+		if round > cur.Number {
+			return fmt.Errorf("%w: unknown approval round %d", ErrInvalidInput, round)
+		}
+		if now.After(cur.ExpiresAt) {
+			// 本轮已到期：迟到决定不计入，需由所有者重签新一轮后再投。
+			return ErrApprovalRoundExpired
+		}
+
+		// 决定必须匹配冻结策略中的角色与该角色绑定的联系人。
+		var frozen *FrozenContact
+		for i := range t.Policy.Contacts {
+			if t.Policy.Contacts[i].Role == role {
+				frozen = &t.Policy.Contacts[i]
+				break
+			}
+		}
+		if frozen == nil {
+			return ErrContactNotRequired
+		}
+		if frozen.ContactID != contactID {
+			return ErrContactRoleMismatch
+		}
+		for _, d := range cur.Decisions {
+			if d.Role == role {
+				// 每轮每角色只能有一个决定事件（事件号不同即为重复决定）。
+				return ErrContactAlreadyDecided
+			}
+		}
+
+		cur.Decisions = append(cur.Decisions, ContactDecision{
+			EventID:   eventID,
+			Round:     round,
+			ContactID: contactID,
+			Role:      role,
+			Approve:   approve,
+			Reason:    reason,
+			At:        now,
+		})
+		verdict := "approved"
+		if !approve {
+			verdict = "rejected"
+		}
+		appendAudit(st, now, "contact_decided", t.Domain, t.ID, contactID,
+			fmt.Sprintf("round=%d role=%s decision=%s", round, role, verdict))
+
+		if !approve {
+			// 明确拒绝立即终局：后续同意、重签或超时均无法再批准。
+			rejectLocked(st, t, now, StatusRejected, contactID, "contact rejected: "+string(role))
+			result = cloneTransfer(t)
+			return nil
+		}
+
+		if contactsSatisfied(t, cur) {
+			// 最后一票：联系人门槛达成，注册商决定期限此刻起算。
+			t.Phase = PhaseRegistrar
+			satisfiedAt := now
+			t.ContactsSatisfiedAt = &satisfiedAt
+			t.Deadline = now.Add(s.decisionWindow)
+			appendAudit(st, now, "contacts_approved", t.Domain, t.ID, "system",
+				"round="+strconv.Itoa(round))
+		}
+		result = cloneTransfer(t)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// ReissueApprovalRound 在当前联系人审批轮次到期后由所有者重新签发一轮。
+// 旧轮次及其决定完整保留以供审计，但新一轮不沿用任何旧决定，
+// 旧轮次的迟到决定一律按 ErrStaleRound 拒绝。
+func (s *Service) ReissueApprovalRound(transferID, actor string) (*Transfer, error) {
+	if transferID == "" || actor == "" {
+		return nil, fmt.Errorf("%w: transfer id and actor are required", ErrInvalidInput)
+	}
+	now := s.now()
+	var result *Transfer
+	err := s.store.transact(func(st *state) error {
+		t, ok := st.Transfers[transferID]
+		if !ok {
+			return ErrTransferNotFound
+		}
+		if t.Status.Terminal() {
+			return ErrTransferNotPending
+		}
+		if actor != t.FromOwnerID {
+			return ErrForbidden
+		}
+		if t.Phase != PhaseContacts || t.Policy == nil {
+			return ErrContactApprovalClosed
+		}
+		cur := t.CurrentRound()
+		if !now.After(cur.ExpiresAt) {
+			return ErrRoundNotExpired
+		}
+		next := newContactRound(cur.Number+1, now, t.Policy.ContactDecisionWindow)
+		t.Rounds = append(t.Rounds, next)
+		appendAudit(st, now, "contact_round_reissued", t.Domain, t.ID, actor,
+			"round="+strconv.Itoa(next.Number))
+		result = cloneTransfer(t)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// GetFrozenPolicy 返回转移创建时冻结的联系人审批策略副本；无联系人策略时返回 nil。
+func (s *Service) GetFrozenPolicy(transferID string) (*FrozenApprovalPolicy, error) {
+	var out *FrozenApprovalPolicy
+	found := false
+	s.store.view(func(st *state) {
+		t, ok := st.Transfers[transferID]
+		if !ok {
+			return
+		}
+		found = true
+		if t.Policy != nil {
+			p := *t.Policy
+			p.RequiredRoles = append([]ContactRole(nil), t.Policy.RequiredRoles...)
+			p.Contacts = append([]FrozenContact(nil), t.Policy.Contacts...)
+			out = &p
+		}
+	})
+	if !found {
+		return nil, ErrTransferNotFound
+	}
+	return out, nil
+}
+
+// ListContactRounds 返回各轮联系人审批及其决定的完整副本（按轮次顺序）。
+func (s *Service) ListContactRounds(transferID string) ([]ContactRound, error) {
+	var out []ContactRound
+	found := false
+	s.store.view(func(st *state) {
+		t, ok := st.Transfers[transferID]
+		if !ok {
+			return
+		}
+		found = true
+		for _, r := range t.Rounds {
+			rc := *r
+			rc.Decisions = append([]ContactDecision(nil), r.Decisions...)
+			out = append(out, rc)
+		}
+	})
+	if !found {
+		return nil, ErrTransferNotFound
+	}
+	return out, nil
+}
+
+// contactsSatisfied 报告当前轮次是否已收齐所有所需角色的同意。
+func contactsSatisfied(t *Transfer, r *ContactRound) bool {
+	approved := map[ContactRole]bool{}
+	for _, d := range r.Decisions {
+		if d.Approve {
+			approved[d.Role] = true
+		}
+	}
+	for _, role := range t.Policy.RequiredRoles {
+		if !approved[role] {
+			return false
+		}
+	}
+	return true
+}
+
+// findDecision 在全部轮次中按事件号查找决定。
+func findDecision(t *Transfer, eventID string) (ContactDecision, bool) {
+	for _, r := range t.Rounds {
+		for _, d := range r.Decisions {
+			if d.EventID == eventID {
+				return d, true
+			}
+		}
+	}
+	return ContactDecision{}, false
+}
+
+// newContactRound 创建一轮审批。
+func newContactRound(number int, now time.Time, window time.Duration) *ContactRound {
+	return &ContactRound{
+		Number:    number,
+		StartedAt: now,
+		ExpiresAt: now.Add(window),
+	}
+}
+
 func (s *Service) GetTransfer(id string) (*Transfer, error) {
 	var out *Transfer
 	s.store.view(func(st *state) {
 		if t, ok := st.Transfers[id]; ok {
-			cp := *t
-			out = &cp
+			out = cloneTransfer(t)
 		}
 	})
 	if out == nil {
@@ -358,8 +784,7 @@ func (s *Service) GetTransferByRef(externalRef string) (*Transfer, error) {
 	s.store.view(func(st *state) {
 		if id, ok := st.TransferByRef[externalRef]; ok {
 			if t, ok := st.Transfers[id]; ok {
-				cp := *t
-				out = &cp
+				out = cloneTransfer(t)
 			}
 		}
 	})
@@ -375,6 +800,9 @@ func (s *Service) GetDomain(name string) (*Domain, error) {
 	s.store.view(func(st *state) {
 		if d, ok := st.Domains[name]; ok {
 			cp := *d
+			if len(d.RequiredRoles) > 0 {
+				cp.RequiredRoles = append([]ContactRole(nil), d.RequiredRoles...)
+			}
 			out = &cp
 		}
 	})

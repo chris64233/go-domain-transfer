@@ -32,4 +32,26 @@ var (
 	ErrDecisionWindowLapsed = errors.New("domaintransfer: decision window has lapsed; awaiting timeout processing")
 	// ErrForbidden 表示调用者无权执行该操作。
 	ErrForbidden = errors.New("domaintransfer: caller is not allowed to perform this action")
+	// ErrContactNotFound 表示联系人不存在。
+	ErrContactNotFound = errors.New("domaintransfer: contact not found")
+	// ErrContactExists 表示联系人 ID 已存在。
+	ErrContactExists = errors.New("domaintransfer: contact already exists")
+	// ErrContactRoleMismatch 表示决定中的联系人/角色与冻结策略不匹配。
+	ErrContactRoleMismatch = errors.New("domaintransfer: contact or role does not match the frozen policy")
+	// ErrContactNotRequired 表示该角色不在转移所需角色组合内。
+	ErrContactNotRequired = errors.New("domaintransfer: contact role is not required by this transfer")
+	// ErrContactDecisionConflict 表示同一事件号携带了不同内容。
+	ErrContactDecisionConflict = errors.New("domaintransfer: decision event id reused with different content")
+	// ErrStaleRound 表示决定属于旧轮次，旧轮次迟到决定不得推进当前转移。
+	ErrStaleRound = errors.New("domaintransfer: decision belongs to a superseded approval round")
+	// ErrRoundNotExpired 表示联系人审批轮次尚未到期，不能重签。
+	ErrRoundNotExpired = errors.New("domaintransfer: current contact approval round has not expired yet")
+	// ErrAwaitingContacts 表示联系人门槛尚未达成，注册商决定期限尚未起算。
+	ErrAwaitingContacts = errors.New("domaintransfer: contact approval threshold not yet satisfied")
+	// ErrContactApprovalClosed 表示联系人审批阶段已关闭（门槛已达成或转移已终态），不再接受决定。
+	ErrContactApprovalClosed = errors.New("domaintransfer: contact approval phase is closed")
+	// ErrContactAlreadyDecided 表示该角色在本轮已经作出过决定。
+	ErrContactAlreadyDecided = errors.New("domaintransfer: contact has already decided in this round")
+	// ErrApprovalRoundExpired 表示当前联系人审批轮次已到期，迟到决定不计入，需所有者重签一轮。
+	ErrApprovalRoundExpired = errors.New("domaintransfer: contact approval round has expired; await a new round")
 )

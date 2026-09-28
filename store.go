@@ -40,6 +40,7 @@ func (p *FilePersister) Load() ([]byte, error) {
 
 // state 是全部可持久化状态。AuthCodes 以摘要为键。
 type state struct {
+	Contacts        map[string]*Contact        `json:"contacts"`
 	Domains         map[string]*Domain         `json:"domains"`
 	AuthCodes       map[string]*AuthCodeRecord `json:"auth_codes"`
 	Transfers       map[string]*Transfer       `json:"transfers"`
@@ -52,6 +53,7 @@ type state struct {
 
 func newState() *state {
 	return &state{
+		Contacts:        map[string]*Contact{},
 		Domains:         map[string]*Domain{},
 		AuthCodes:       map[string]*AuthCodeRecord{},
 		Transfers:       map[string]*Transfer{},
@@ -64,6 +66,7 @@ func newState() *state {
 // clone 深拷贝整个状态，用于 clone-and-swap 事务。
 func (s *state) clone() *state {
 	c := &state{
+		Contacts:        make(map[string]*Contact, len(s.Contacts)),
 		Domains:         make(map[string]*Domain, len(s.Domains)),
 		AuthCodes:       make(map[string]*AuthCodeRecord, len(s.AuthCodes)),
 		Transfers:       make(map[string]*Transfer, len(s.Transfers)),
@@ -73,8 +76,15 @@ func (s *state) clone() *state {
 		Audit:           make([]AuditEntry, len(s.Audit)),
 		Seq:             s.Seq,
 	}
+	for k, v := range s.Contacts {
+		ct := *v
+		c.Contacts[k] = &ct
+	}
 	for k, v := range s.Domains {
 		d := *v
+		if len(v.RequiredRoles) > 0 {
+			d.RequiredRoles = append([]ContactRole(nil), v.RequiredRoles...)
+		}
 		c.Domains[k] = &d
 	}
 	for k, v := range s.AuthCodes {
@@ -86,12 +96,7 @@ func (s *state) clone() *state {
 		c.AuthCodes[k] = &r
 	}
 	for k, v := range s.Transfers {
-		t := *v
-		if v.DecidedAt != nil {
-			d := *v.DecidedAt
-			t.DecidedAt = &d
-		}
-		c.Transfers[k] = &t
+		c.Transfers[k] = cloneTransfer(v)
 	}
 	for k, v := range s.TransferByRef {
 		c.TransferByRef[k] = v
@@ -105,6 +110,36 @@ func (s *state) clone() *state {
 	}
 	copy(c.Audit, s.Audit)
 	return c
+}
+
+// cloneTransfer 深拷贝单笔转移及其冻结策略、各轮决定。
+func cloneTransfer(v *Transfer) *Transfer {
+	t := *v
+	if v.DecidedAt != nil {
+		d := *v.DecidedAt
+		t.DecidedAt = &d
+	}
+	if v.ContactsSatisfiedAt != nil {
+		d := *v.ContactsSatisfiedAt
+		t.ContactsSatisfiedAt = &d
+	}
+	if v.Policy != nil {
+		p := *v.Policy
+		p.RequiredRoles = append([]ContactRole(nil), v.Policy.RequiredRoles...)
+		p.Contacts = append([]FrozenContact(nil), v.Policy.Contacts...)
+		t.Policy = &p
+	}
+	if len(v.Rounds) > 0 {
+		t.Rounds = make([]*ContactRound, len(v.Rounds))
+		for i, r := range v.Rounds {
+			rc := *r
+			if len(r.Decisions) > 0 {
+				rc.Decisions = append([]ContactDecision(nil), r.Decisions...)
+			}
+			t.Rounds[i] = &rc
+		}
+	}
+	return &t
 }
 
 // Store 持有全部状态，以单互斥锁 + clone-and-swap 提供原子事务边界：
