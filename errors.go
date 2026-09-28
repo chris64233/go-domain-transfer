@@ -32,4 +32,18 @@ var (
 	ErrDecisionWindowLapsed = errors.New("domaintransfer: decision window has lapsed; awaiting timeout processing")
 	// ErrForbidden 表示调用者无权执行该操作。
 	ErrForbidden = errors.New("domaintransfer: caller is not allowed to perform this action")
+	// ErrContactGatePending 表示联系人审批门槛尚未达成，注册商决定期限尚未开始。
+	ErrContactGatePending = errors.New("domaintransfer: contact approval gate has not been satisfied")
+	// ErrContactGateAlreadyPassed 表示联系人门槛已达成，无需（也不允许）再重开轮次。
+	ErrContactGateAlreadyPassed = errors.New("domaintransfer: contact approval gate has already been satisfied")
+	// ErrContactPolicyMissing 表示该转移未冻结任何联系人审批策略。
+	ErrContactPolicyMissing = errors.New("domaintransfer: transfer has no contact approval policy")
+	// ErrContactRoundActive 表示当前联系人轮次尚未超期，所有者还不能重新签发。
+	ErrContactRoundActive = errors.New("domaintransfer: current contact approval round has not lapsed yet")
+	// ErrContactAlreadyDecided 表示该联系人在当前轮次已提交过决定。
+	ErrContactAlreadyDecided = errors.New("domaintransfer: contact has already decided in the current approval round")
+	// ErrDecisionConflict 表示同一决定事件号已被不同内容占用（幂等冲突）。
+	ErrDecisionConflict = errors.New("domaintransfer: decision event id already used with different content")
+	// ErrDecisionRoundStale 表示决定指向已被取代的旧轮次，不得推进当前转移。
+	ErrDecisionRoundStale = errors.New("domaintransfer: decision belongs to a superseded approval round")
 )

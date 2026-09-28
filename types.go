@@ -6,7 +6,7 @@ import "time"
 type TransferStatus string
 
 const (
-	StatusPending      TransferStatus = "pending"       // 等待原注册商决定
+	StatusPending      TransferStatus = "pending"       // 等待（先经联系人门槛，后等原注册商决定）
 	StatusApproved     TransferStatus = "approved"      // 人工批准（终态）
 	StatusAutoApproved TransferStatus = "auto_approved" // 超时按策略自动批准（终态）
 	StatusRejected     TransferStatus = "rejected"      // 人工/策略拒绝（终态）
@@ -16,13 +16,68 @@ const (
 // Terminal 报告状态是否为终态。终态不可逆，迟到回调不得覆盖。
 func (s TransferStatus) Terminal() bool { return s != StatusPending }
 
+// ContactRole 是联系人在转移审批中承担的冻结角色。
+type ContactRole string
+
+const (
+	// RoleAdmin 管理联系人。
+	RoleAdmin ContactRole = "admin"
+	// RoleTech 技术联系人。
+	RoleTech ContactRole = "tech"
+)
+
+// validRole 报告角色是否受支持。
+func validRole(r ContactRole) bool { return r == RoleAdmin || r == RoleTech }
+
+// Contact 是域名的当前联系人资料。凭据只保存摘要，绝不保存明文。
+type Contact struct {
+	ID              string      `json:"id"`
+	Role            ContactRole `json:"role"`
+	Name            string      `json:"name"`
+	Email           string      `json:"email"`
+	CredentialHash  string      `json:"credential_hash"` // SHA-256(contactID || 0x00 || credential)
+	CredentialSetAt time.Time   `json:"credential_set_at"`
+}
+
+// ApprovalPolicy 是发起转移时冻结进转移单的联系人审批策略（值类型快照）。
+// 之后域名联系人资料如何变化，都不得改变进行中转移的门槛。
+type ApprovalPolicy struct {
+	RequiredRoles []ContactRole `json:"required_roles"` // 发起转移所需的角色组合（去重）
+	Contacts      []Contact     `json:"contacts"`       // 创建时冻结的联系人快照（含凭据摘要）
+	RoundLapse    time.Duration `json:"round_lapse"`    // 单轮联系人审批无响应期限
+	RequireAll    bool          `json:"require_all"`    // true=所需角色全部同意；false=任一同意
+}
+
+// ContactDecision 是某个联系人在某一轮中的唯一决定事件。
+type ContactDecision struct {
+	EventID        string      `json:"event_id"` // 幂等键
+	ContactID      string      `json:"contact_id"`
+	Role           ContactRole `json:"role"` // 冻结角色，必须与策略匹配
+	Round          int         `json:"round"`
+	Approve        bool        `json:"approve"`
+	CredentialHash string      `json:"credential_hash"` // 与冻结快照比对，绝不保存明文
+	Reason         string      `json:"reason,omitempty"`
+	DecidedAt      time.Time   `json:"decided_at"`
+}
+
+// ContactRound 是一轮联系人审批。旧轮次的决定保留用于审计，但不再推进当前转移。
+type ContactRound struct {
+	Number     int               `json:"number"` // 从 1 起
+	StartedAt  time.Time         `json:"started_at"`
+	LapsesAt   time.Time         `json:"lapses_at"`
+	GatePassed bool              `json:"gate_passed"` // 门槛是否在本轮达成
+	Decisions  []ContactDecision `json:"decisions"`
+}
+
 // Domain 是域名的当前登记信息。
 type Domain struct {
-	Name      string `json:"name"`
-	OwnerID   string `json:"owner_id"`
-	Registrar string `json:"registrar"`
-	Locked    bool   `json:"locked"`
-	Version   int64  `json:"version"`
+	Name      string              `json:"name"`
+	OwnerID   string              `json:"owner_id"`
+	Registrar string              `json:"registrar"`
+	Locked    bool                `json:"locked"`
+	Version   int64               `json:"version"`
+	Contacts  map[string]*Contact `json:"contacts"`           // 实时联系人资料（按 ID）
+	Approval  *ApprovalPolicy     `json:"approval,omitempty"` // 实时审批策略（转移时冻结拷贝）
 }
 
 // AuthCodeRecord 是授权码的持久化记录。只保存摘要，绝不保存明文。
@@ -47,9 +102,16 @@ type Transfer struct {
 	Status        TransferStatus `json:"status"`
 	Reason        string         `json:"reason,omitempty"`
 	CreatedAt     time.Time      `json:"created_at"`
-	Deadline      time.Time      `json:"deadline"` // 原注册商决定期限
-	DecidedAt     *time.Time     `json:"decided_at,omitempty"`
-	DecidedBy     string         `json:"decided_by,omitempty"`
+	// FrozenPolicy 是创建时冻结的联系人审批策略；nil 表示该转移无联系人门槛（向后兼容）。
+	FrozenPolicy *ApprovalPolicy `json:"frozen_policy,omitempty"`
+	// ContactRounds 是各轮联系人审批（含历史轮次），当前轮为最后一个元素。
+	ContactRounds []ContactRound `json:"contact_rounds,omitempty"`
+	// GatePassedAt 记录联系人门槛达成时刻；为零表示门槛尚未达成。
+	GatePassedAt *time.Time `json:"gate_passed_at,omitempty"`
+	// Deadline 是原注册商决定期限；门槛达成前为零值，达成时才开始计算。
+	Deadline  time.Time  `json:"deadline"`
+	DecidedAt *time.Time `json:"decided_at,omitempty"`
+	DecidedBy string     `json:"decided_by,omitempty"`
 }
 
 // OutboxMessage 是状态终局时生成的唯一外发消息（outbox 模式），

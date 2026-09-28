@@ -43,7 +43,8 @@ type state struct {
 	Domains         map[string]*Domain         `json:"domains"`
 	AuthCodes       map[string]*AuthCodeRecord `json:"auth_codes"`
 	Transfers       map[string]*Transfer       `json:"transfers"`
-	TransferByRef   map[string]string          `json:"transfer_by_ref"` // externalRef -> transferID
+	TransferByRef   map[string]string          `json:"transfer_by_ref"`   // externalRef -> transferID
+	DecisionByEvent map[string]string          `json:"decision_by_event"` // contact decision eventID -> transferID（幂等/冲突）
 	PendingByDomain map[string]string          `json:"pending_by_domain"`
 	Outbox          map[string]*OutboxMessage  `json:"outbox"`
 	Audit           []AuditEntry               `json:"audit"`
@@ -56,6 +57,7 @@ func newState() *state {
 		AuthCodes:       map[string]*AuthCodeRecord{},
 		Transfers:       map[string]*Transfer{},
 		TransferByRef:   map[string]string{},
+		DecisionByEvent: map[string]string{},
 		PendingByDomain: map[string]string{},
 		Outbox:          map[string]*OutboxMessage{},
 	}
@@ -68,6 +70,7 @@ func (s *state) clone() *state {
 		AuthCodes:       make(map[string]*AuthCodeRecord, len(s.AuthCodes)),
 		Transfers:       make(map[string]*Transfer, len(s.Transfers)),
 		TransferByRef:   make(map[string]string, len(s.TransferByRef)),
+		DecisionByEvent: make(map[string]string, len(s.DecisionByEvent)),
 		PendingByDomain: make(map[string]string, len(s.PendingByDomain)),
 		Outbox:          make(map[string]*OutboxMessage, len(s.Outbox)),
 		Audit:           make([]AuditEntry, len(s.Audit)),
@@ -75,6 +78,16 @@ func (s *state) clone() *state {
 	}
 	for k, v := range s.Domains {
 		d := *v
+		if v.Contacts != nil {
+			d.Contacts = make(map[string]*Contact, len(v.Contacts))
+			for cid, c := range v.Contacts {
+				cc := *c
+				d.Contacts[cid] = &cc
+			}
+		}
+		if v.Approval != nil {
+			d.Approval = clonePolicy(v.Approval)
+		}
 		c.Domains[k] = &d
 	}
 	for k, v := range s.AuthCodes {
@@ -91,10 +104,23 @@ func (s *state) clone() *state {
 			d := *v.DecidedAt
 			t.DecidedAt = &d
 		}
+		if v.GatePassedAt != nil {
+			g := *v.GatePassedAt
+			t.GatePassedAt = &g
+		}
+		if v.FrozenPolicy != nil {
+			t.FrozenPolicy = clonePolicy(v.FrozenPolicy)
+		}
+		if len(v.ContactRounds) > 0 {
+			t.ContactRounds = cloneRounds(v.ContactRounds)
+		}
 		c.Transfers[k] = &t
 	}
 	for k, v := range s.TransferByRef {
 		c.TransferByRef[k] = v
+	}
+	for k, v := range s.DecisionByEvent {
+		c.DecisionByEvent[k] = v
 	}
 	for k, v := range s.PendingByDomain {
 		c.PendingByDomain[k] = v
@@ -162,9 +188,87 @@ func (s *Store) view(fn func(st *state)) {
 	fn(s.st)
 }
 
+// viewErr 在锁内执行可返回错误的只读函数。实现方必须返回拷贝，不得泄露内部指针。
+func (s *Store) viewErr(fn func(st *state) error) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return fn(s.st)
+}
+
 // snapshotJSON 导出当前状态快照（测试与调试用途）。
 func (s *Store) snapshotJSON() ([]byte, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return json.Marshal(s.st)
+}
+
+// clonePolicy 深拷贝审批策略及其冻结的联系人快照。
+func clonePolicy(p *ApprovalPolicy) *ApprovalPolicy {
+	if p == nil {
+		return nil
+	}
+	c := &ApprovalPolicy{
+		RoundLapse: p.RoundLapse,
+		RequireAll: p.RequireAll,
+	}
+	if len(p.RequiredRoles) > 0 {
+		c.RequiredRoles = append([]ContactRole(nil), p.RequiredRoles...)
+	}
+	if len(p.Contacts) > 0 {
+		c.Contacts = make([]Contact, len(p.Contacts))
+		copy(c.Contacts, p.Contacts)
+	}
+	return c
+}
+
+// cloneRounds 深拷贝各轮审批及其决定。
+func cloneRounds(rounds []ContactRound) []ContactRound {
+	out := make([]ContactRound, len(rounds))
+	for i := range rounds {
+		out[i].Number = rounds[i].Number
+		out[i].StartedAt = rounds[i].StartedAt
+		out[i].LapsesAt = rounds[i].LapsesAt
+		out[i].GatePassed = rounds[i].GatePassed
+		if len(rounds[i].Decisions) > 0 {
+			out[i].Decisions = make([]ContactDecision, len(rounds[i].Decisions))
+			copy(out[i].Decisions, rounds[i].Decisions)
+		}
+	}
+	return out
+}
+
+// cloneTransfer 深拷贝转移单（含冻结策略与各轮决定），避免泄露内部指针。
+func cloneTransfer(t *Transfer) *Transfer {
+	cp := *t
+	if t.DecidedAt != nil {
+		d := *t.DecidedAt
+		cp.DecidedAt = &d
+	}
+	if t.GatePassedAt != nil {
+		g := *t.GatePassedAt
+		cp.GatePassedAt = &g
+	}
+	if t.FrozenPolicy != nil {
+		cp.FrozenPolicy = clonePolicy(t.FrozenPolicy)
+	}
+	if len(t.ContactRounds) > 0 {
+		cp.ContactRounds = cloneRounds(t.ContactRounds)
+	}
+	return &cp
+}
+
+// cloneDomain 深拷贝域名当前资料（含联系人和实时策略）。
+func cloneDomain(d *Domain) *Domain {
+	cp := *d
+	if d.Contacts != nil {
+		cp.Contacts = make(map[string]*Contact, len(d.Contacts))
+		for k, c := range d.Contacts {
+			cc := *c
+			cp.Contacts[k] = &cc
+		}
+	}
+	if d.Approval != nil {
+		cp.Approval = clonePolicy(d.Approval)
+	}
+	return &cp
 }
