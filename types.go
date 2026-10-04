@@ -69,6 +69,35 @@ type ContactRound struct {
 	Decisions  []ContactDecision `json:"decisions"`
 }
 
+// ChangeRequestStatus 是联系人变更申请的状态机取值。
+type ChangeRequestStatus string
+
+const (
+	ChangePending  ChangeRequestStatus = "pending"  // 待审批
+	ChangeApproved ChangeRequestStatus = "approved" // 审批通过并已写入域名当前资料（终态）
+	ChangeRejected ChangeRequestStatus = "rejected" // 审批拒绝（终态）
+	ChangeVoided   ChangeRequestStatus = "voided"   // 失效：版本不一致/域名锁定/转移完成，不可继续处理（终态）
+)
+
+// Terminal 报告申请状态是否为终态。终态不可逆，迟到的审批不得覆盖。
+func (s ChangeRequestStatus) Terminal() bool { return s != ChangePending }
+
+// ContactChangeRequest 是一笔联系人变更申请。
+// 申请创建时深拷贝冻结当时的联系人资料快照与域名资料版本；
+// 此后域名当前联系人如何修改，都不会改变待审批的内容。
+type ContactChangeRequest struct {
+	ID          string              `json:"id"`           // 申请号，幂等键
+	Domain      string              `json:"domain"`       // 目标域名
+	RequesterID string              `json:"requester_id"` // 申请人
+	BaseVersion int64               `json:"base_version"` // 提交时看到的域名资料版本
+	Snapshot    []Contact           `json:"snapshot"`     // 冻结的联系人资料快照（凭据仅存摘要）
+	Status      ChangeRequestStatus `json:"status"`
+	Reason      string              `json:"reason,omitempty"` // 审批意见或作废原因
+	CreatedAt   time.Time           `json:"created_at"`
+	DecidedAt   *time.Time          `json:"decided_at,omitempty"`
+	DecidedBy   string              `json:"decided_by,omitempty"`
+}
+
 // Domain 是域名的当前登记信息。
 type Domain struct {
 	Name      string              `json:"name"`

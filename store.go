@@ -40,15 +40,16 @@ func (p *FilePersister) Load() ([]byte, error) {
 
 // state 是全部可持久化状态。AuthCodes 以摘要为键。
 type state struct {
-	Domains         map[string]*Domain         `json:"domains"`
-	AuthCodes       map[string]*AuthCodeRecord `json:"auth_codes"`
-	Transfers       map[string]*Transfer       `json:"transfers"`
-	TransferByRef   map[string]string          `json:"transfer_by_ref"`   // externalRef -> transferID
-	DecisionByEvent map[string]string          `json:"decision_by_event"` // contact decision eventID -> transferID（幂等/冲突）
-	PendingByDomain map[string]string          `json:"pending_by_domain"`
-	Outbox          map[string]*OutboxMessage  `json:"outbox"`
-	Audit           []AuditEntry               `json:"audit"`
-	Seq             int64                      `json:"seq"`
+	Domains         map[string]*Domain               `json:"domains"`
+	AuthCodes       map[string]*AuthCodeRecord       `json:"auth_codes"`
+	Transfers       map[string]*Transfer             `json:"transfers"`
+	TransferByRef   map[string]string                `json:"transfer_by_ref"`   // externalRef -> transferID
+	DecisionByEvent map[string]string                `json:"decision_by_event"` // contact decision eventID -> transferID（幂等/冲突）
+	PendingByDomain map[string]string                `json:"pending_by_domain"`
+	ChangeRequests  map[string]*ContactChangeRequest `json:"change_requests"` // 联系人变更申请（按申请号）
+	Outbox          map[string]*OutboxMessage        `json:"outbox"`
+	Audit           []AuditEntry                     `json:"audit"`
+	Seq             int64                            `json:"seq"`
 }
 
 func newState() *state {
@@ -59,6 +60,7 @@ func newState() *state {
 		TransferByRef:   map[string]string{},
 		DecisionByEvent: map[string]string{},
 		PendingByDomain: map[string]string{},
+		ChangeRequests:  map[string]*ContactChangeRequest{},
 		Outbox:          map[string]*OutboxMessage{},
 	}
 }
@@ -72,6 +74,7 @@ func (s *state) clone() *state {
 		TransferByRef:   make(map[string]string, len(s.TransferByRef)),
 		DecisionByEvent: make(map[string]string, len(s.DecisionByEvent)),
 		PendingByDomain: make(map[string]string, len(s.PendingByDomain)),
+		ChangeRequests:  make(map[string]*ContactChangeRequest, len(s.ChangeRequests)),
 		Outbox:          make(map[string]*OutboxMessage, len(s.Outbox)),
 		Audit:           make([]AuditEntry, len(s.Audit)),
 		Seq:             s.Seq,
@@ -125,12 +128,28 @@ func (s *state) clone() *state {
 	for k, v := range s.PendingByDomain {
 		c.PendingByDomain[k] = v
 	}
+	for k, v := range s.ChangeRequests {
+		c.ChangeRequests[k] = cloneChangeRequest(v)
+	}
 	for k, v := range s.Outbox {
 		m := *v
 		c.Outbox[k] = &m
 	}
 	copy(c.Audit, s.Audit)
 	return c
+}
+
+// cloneChangeRequest 深拷贝联系人变更申请（含冻结快照）。
+func cloneChangeRequest(r *ContactChangeRequest) *ContactChangeRequest {
+	c := *r
+	if r.DecidedAt != nil {
+		d := *r.DecidedAt
+		c.DecidedAt = &d
+	}
+	if r.Snapshot != nil {
+		c.Snapshot = append([]Contact(nil), r.Snapshot...)
+	}
+	return &c
 }
 
 // Store 持有全部状态，以单互斥锁 + clone-and-swap 提供原子事务边界：

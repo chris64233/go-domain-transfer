@@ -12,7 +12,9 @@
 - **联系人审批门禁**：只有所需角色的联系人门槛达成后，原注册商的批准期限或自动批准期限**才开始计算**（`Transfer.Deadline` 在门槛达成前为零值）。任一所需角色联系人明确拒绝，转移立即终态拒绝，且不会再被其他同意或超时规则批准。
 - **联系人决定事件**：每票是唯一事件（`eventID`），必须匹配转移、轮次、联系人及其冻结角色与凭据摘要。相同事件相同内容幂等，同号异内容返回 `ErrDecisionConflict`；同一联系人在同一轮只能投一票。
 - **多轮审批**：联系人长期无响应时，所有者可在单轮期限超期后重新签发一轮。新一轮保留旧轮决定用于审计但**不沿用**；指向旧轮的迟到决定返回 `ErrDecisionRoundStale`，不得推进当前转移。
+- **联系人变更审批**：联系人资料变更走"申请 → 所有者审批 → 原子写入"流程。申请创建时**冻结**域名、申请人、提交时看到的资料版本（`BaseVersion`）与联系人快照（凭据仅存摘要）；此后域名当前联系人如何修改，都不改变待审批内容。审批只作用于未完成且版本一致的申请：转移完成、域名锁定或联系人再次修改时，旧申请明确作废（`ChangeVoided`），迟到的旧审批不得回写。审批通过与联系人写入处于同一事务边界，写入失败时审批结果与域名资料都不更新。
 - **幂等发起**：外部转移号（`externalRef`）为幂等键——同号同内容返回既有转移单，同号异内容返回 `ErrTransferConflict`。
+- **幂等变更申请**：申请号（`requestID`）为幂等键——同号同内容（含资料版本）返回原记录，资料、域名或审批版本变化时返回 `ErrChangeRequestConflict`。
 - **注册商决定与超时**：门禁通过后，原注册商可在决定期限内（默认 5 天，自门禁通过时起算）批准或拒绝；超期由 `AdvanceTimeouts` 按策略落终态（默认自动批准，可配置自动拒绝）。门禁未通过时超时绝不触发。
 - **终态唯一**：联系人最后一票、所有者取消、注册商决定、超时推进共享同一事务边界，并发竞争时只有一个生效；终态不可逆，迟到回调返回 `ErrTransferNotPending`，不得覆盖。
 - **批准原子性**：批准在同一事务内切换域名所有权与注册商、解锁域名并生成唯一 outbox 消息；任何失败（含持久化失败）都不会留下"域名已锁定但转移没记录"或"已取消却已切换所有权"的中间状态。
@@ -49,8 +51,11 @@
 | `ReissueContactRound(transferID, owner)` | 单轮超期后所有者重新签发一轮审批 |
 | `Decide(transferID, registrar, approve, reason)` | 门禁通过后原注册商在期限内批准/拒绝 |
 | `Cancel(transferID, actor)` | 域名所有者取消 |
+| `SubmitContactChange(requestID, domain, requester, baseVersion, contacts)` | 提交联系人变更申请：冻结资料版本与快照（幂等/冲突/过期版本拒绝） |
+| `DecideContactChange(requestID, approver, approve, reason)` | 所有者审批变更申请；通过则同事务写入域名当前资料，版本不一致的申请作废 |
 | `AdvanceTimeouts()` | 门禁通过且超期后按策略落终态，返回处理笔数 |
 | `GetTransfer(id)` / `GetTransferByRef(ref)` / `GetDomain(name)` | 状态查询（含冻结策略、各轮、门禁时间与注册商期限） |
+| `GetContactChange(requestID)` / `ListContactChanges(domain)` | 变更申请查询 |
 | `GetApprovalPolicy(transferID)` / `ListContactRounds(transferID)` | 冻结策略 / 各轮联系人决定查询 |
 | `ListAudit(domain)` / `ListOutbox()` | 完整审计历史 / outbox 消息 |
 
@@ -58,13 +63,17 @@
 
 ```
 service.go    业务操作与状态机（全部并发安全）
+change.go     联系人变更申请：提交（冻结快照与版本）、审批、作废与查询
 store.go      Store：单互斥锁 + clone-and-swap 事务；Persister 抽象与文件实现
 types.go      Domain / Contact / ApprovalPolicy / ContactRound / ContactDecision / Transfer / ...
 errors.go     哨兵错误（不含敏感值）
 contact_test.go 联系人门禁相关自动化测试
+contact_change_test.go 联系人变更审批相关自动化测试
 ```
 
 **冻结设计**：`ApprovalPolicy` 在 `InitiateTransfer` 时经 `clonePolicy` 深拷贝进 `Transfer.FrozenPolicy`，联系人凭据以摘要形式冻结；`ContactRounds` 逐轮追加，历史轮决定保留可审计。所有深拷贝在 `store.go` 的 `clone*` 辅助函数中维护。
+
+**变更申请设计**：`ContactChangeRequest` 在 `SubmitContactChange` 时冻结快照与 `BaseVersion`；`DecideContactChange` 复核"未完成 + 域名未锁定 + 版本一致"后才写入，写入与审批结果同事务提交。`InitiateTransfer`（锁定）、`ConfigureContacts`（资料修改）、转移批准（所有权切换）在同一事务内将待审批申请作废，保证审批、转移、取消与资料修改并发时一个域名只留下一个有效联系人版本。
 
 **原子性设计**：`Store.transact` 在状态副本上应用变更，先持久化（`FilePersister` 用临时文件 + rename 原子写），全部成功才整体换入。联系人最后一票与门禁通过、注册商决定、取消、超时因此天然串行化，保证状态单调、终态唯一且 outbox 不重复。任一步失败，已提交状态不受影响。
 
@@ -120,3 +129,9 @@ svc.Decide(tr.ID, "reg-a", true, "verified")
 - 联系人最后一票 / 所有者取消 / 注册商决定并发下状态单调、唯一终态、无重复 outbox、无"已取消却切换所有权"；
 - 持久化往返后冻结策略与各轮决定完整恢复，落盘不含明文授权码或凭据；
 - 完整审计轨迹与冻结策略/各轮决定查询；未配置策略的域名保持原有行为。
+- 变更申请：创建后原联系人修改不改变待审批内容且旧申请作废；
+- 申请号幂等：同号同内容返回原记录，资料/域名/审批版本变化返回冲突，过期版本提交被拒；
+- 审批原子写入：通过后域名资料与版本同步前进，重复审批被拒，非所有者被拒，拒绝不改资料；
+- 版本冲突：域名锁定、转移完成、联系人再次修改后旧申请明确作废，迟到审批不得回写；
+- 写入失败：持久化失败时审批结果与域名资料同时回滚，不留单边更新；
+- 审批与资料修改并发竞争：最终只留下一个一致的有效联系人版本。

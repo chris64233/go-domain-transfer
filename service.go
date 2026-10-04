@@ -165,25 +165,9 @@ func (s *Service) ConfigureContacts(domain, ownerID string, contacts []ContactSp
 		// 已创建的转移持有冻结快照，门槛不受影响。
 
 		// 规范化并校验联系人。
-		newContacts := make(map[string]*Contact, len(contacts))
-		for _, c := range contacts {
-			if c.ID == "" || c.Name == "" || c.Email == "" || c.Credential == "" {
-				return fmt.Errorf("%w: contact id, name, email and credential are required", ErrInvalidInput)
-			}
-			if !validRole(c.Role) {
-				return fmt.Errorf("%w: unsupported contact role %q", ErrInvalidInput, c.Role)
-			}
-			if _, dup := newContacts[c.ID]; dup {
-				return fmt.Errorf("%w: duplicate contact id %q", ErrInvalidInput, c.ID)
-			}
-			newContacts[c.ID] = &Contact{
-				ID:              c.ID,
-				Role:            c.Role,
-				Name:            c.Name,
-				Email:           c.Email,
-				CredentialHash:  credentialDigest(c.ID, c.Credential),
-				CredentialSetAt: now,
-			}
+		newContacts, err := normalizeContactSpecs(contacts, now)
+		if err != nil {
+			return err
 		}
 
 		// 规范化并校验所需角色组合。
@@ -222,10 +206,37 @@ func (s *Service) ConfigureContacts(domain, ownerID string, contacts []ContactSp
 			RequireAll:    requireAll,
 		}
 		d.Version++
+		// 联系人资料被再次修改：基于旧版本的待审批变更申请明确作废。
+		voidPendingChangesLocked(st, domain, now, "contacts reconfigured")
 		appendAudit(st, now, "contacts_configured", domain, "", ownerID,
 			fmt.Sprintf("roles=%s require_all=%t round_lapse=%s", joinRoles(roles), requireAll, lapse))
 		return nil
 	})
+}
+
+// normalizeContactSpecs 规范化并校验联系人入参，明文凭据立即转为摘要，绝不持久化。
+func normalizeContactSpecs(specs []ContactSpec, now time.Time) (map[string]*Contact, error) {
+	out := make(map[string]*Contact, len(specs))
+	for _, c := range specs {
+		if c.ID == "" || c.Name == "" || c.Email == "" || c.Credential == "" {
+			return nil, fmt.Errorf("%w: contact id, name, email and credential are required", ErrInvalidInput)
+		}
+		if !validRole(c.Role) {
+			return nil, fmt.Errorf("%w: unsupported contact role %q", ErrInvalidInput, c.Role)
+		}
+		if _, dup := out[c.ID]; dup {
+			return nil, fmt.Errorf("%w: duplicate contact id %q", ErrInvalidInput, c.ID)
+		}
+		out[c.ID] = &Contact{
+			ID:              c.ID,
+			Role:            c.Role,
+			Name:            c.Name,
+			Email:           c.Email,
+			CredentialHash:  credentialDigest(c.ID, c.Credential),
+			CredentialSetAt: now,
+		}
+	}
+	return out, nil
 }
 
 // GenerateAuthCode 为域名所有者生成一次性短期授权码。
@@ -323,6 +334,8 @@ func (s *Service) InitiateTransfer(externalRef, domain, code, actor string) (*Tr
 		rec.ConsumedAt = &consumed
 		d.Locked = true
 		d.Version++
+		// 域名被转移锁定：待审批的联系人变更申请明确作废，不可继续处理。
+		voidPendingChangesLocked(st, domain, now, "domain locked by in-flight transfer")
 
 		t := &Transfer{
 			ID:            newTransferID(st),
@@ -731,6 +744,8 @@ func approveLocked(st *state, t *Transfer, now time.Time, status TransferStatus,
 	d.Registrar = t.ToRegistrar
 	d.Locked = false
 	d.Version++
+	// 转移完成、所有权切换：基于旧资料的待审批变更申请明确作废。
+	voidPendingChangesLocked(st, t.Domain, now, "transfer completed")
 	delete(st.PendingByDomain, t.Domain)
 
 	t.Status = status
