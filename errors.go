@@ -46,4 +46,12 @@ var (
 	ErrDecisionConflict = errors.New("domaintransfer: decision event id already used with different content")
 	// ErrDecisionRoundStale 表示决定指向已被取代的旧轮次，不得推进当前转移。
 	ErrDecisionRoundStale = errors.New("domaintransfer: decision belongs to a superseded approval round")
+	// ErrChangeRequestNotFound 表示联系人变更申请不存在。
+	ErrChangeRequestNotFound = errors.New("domaintransfer: contact change request not found")
+	// ErrChangeRequestConflict 表示申请号已被不同内容（资料、域名或版本）占用（幂等冲突）。
+	ErrChangeRequestConflict = errors.New("domaintransfer: change request ref already used with different content")
+	// ErrChangeRequestNotPending 表示变更申请已进入终态，重复审批不得覆盖。
+	ErrChangeRequestNotPending = errors.New("domaintransfer: contact change request is already in a terminal state")
+	// ErrChangeRequestStale 表示变更申请已被取代（域名锁定、转移完成或资料再次修改），不可继续处理。
+	ErrChangeRequestStale = errors.New("domaintransfer: contact change request is superseded or targets a stale version")
 )

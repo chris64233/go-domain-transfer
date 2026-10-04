@@ -40,15 +40,17 @@ func (p *FilePersister) Load() ([]byte, error) {
 
 // state 是全部可持久化状态。AuthCodes 以摘要为键。
 type state struct {
-	Domains         map[string]*Domain         `json:"domains"`
-	AuthCodes       map[string]*AuthCodeRecord `json:"auth_codes"`
-	Transfers       map[string]*Transfer       `json:"transfers"`
-	TransferByRef   map[string]string          `json:"transfer_by_ref"`   // externalRef -> transferID
-	DecisionByEvent map[string]string          `json:"decision_by_event"` // contact decision eventID -> transferID（幂等/冲突）
-	PendingByDomain map[string]string          `json:"pending_by_domain"`
-	Outbox          map[string]*OutboxMessage  `json:"outbox"`
-	Audit           []AuditEntry               `json:"audit"`
-	Seq             int64                      `json:"seq"`
+	Domains         map[string]*Domain               `json:"domains"`
+	AuthCodes       map[string]*AuthCodeRecord       `json:"auth_codes"`
+	Transfers       map[string]*Transfer             `json:"transfers"`
+	TransferByRef   map[string]string                `json:"transfer_by_ref"`   // externalRef -> transferID
+	DecisionByEvent map[string]string                `json:"decision_by_event"` // contact decision eventID -> transferID（幂等/冲突）
+	PendingByDomain map[string]string                `json:"pending_by_domain"`
+	ChangeRequests  map[string]*ContactChangeRequest `json:"change_requests"` // 变更申请（按 ID）
+	ChangeByRef     map[string]string                `json:"change_by_ref"`   // requestRef -> changeRequestID（幂等/冲突）
+	Outbox          map[string]*OutboxMessage        `json:"outbox"`
+	Audit           []AuditEntry                     `json:"audit"`
+	Seq             int64                            `json:"seq"`
 }
 
 func newState() *state {
@@ -59,6 +61,8 @@ func newState() *state {
 		TransferByRef:   map[string]string{},
 		DecisionByEvent: map[string]string{},
 		PendingByDomain: map[string]string{},
+		ChangeRequests:  map[string]*ContactChangeRequest{},
+		ChangeByRef:     map[string]string{},
 		Outbox:          map[string]*OutboxMessage{},
 	}
 }
@@ -72,6 +76,8 @@ func (s *state) clone() *state {
 		TransferByRef:   make(map[string]string, len(s.TransferByRef)),
 		DecisionByEvent: make(map[string]string, len(s.DecisionByEvent)),
 		PendingByDomain: make(map[string]string, len(s.PendingByDomain)),
+		ChangeRequests:  make(map[string]*ContactChangeRequest, len(s.ChangeRequests)),
+		ChangeByRef:     make(map[string]string, len(s.ChangeByRef)),
 		Outbox:          make(map[string]*OutboxMessage, len(s.Outbox)),
 		Audit:           make([]AuditEntry, len(s.Audit)),
 		Seq:             s.Seq,
@@ -124,6 +130,12 @@ func (s *state) clone() *state {
 	}
 	for k, v := range s.PendingByDomain {
 		c.PendingByDomain[k] = v
+	}
+	for k, v := range s.ChangeRequests {
+		c.ChangeRequests[k] = cloneChangeRequest(v)
+	}
+	for k, v := range s.ChangeByRef {
+		c.ChangeByRef[k] = v
 	}
 	for k, v := range s.Outbox {
 		m := *v
@@ -269,6 +281,23 @@ func cloneDomain(d *Domain) *Domain {
 	}
 	if d.Approval != nil {
 		cp.Approval = clonePolicy(d.Approval)
+	}
+	return &cp
+}
+
+// cloneChangeRequest 深拷贝联系人变更申请（含冻结的联系人快照），避免泄露内部指针。
+func cloneChangeRequest(r *ContactChangeRequest) *ContactChangeRequest {
+	cp := *r
+	if r.DecidedAt != nil {
+		d := *r.DecidedAt
+		cp.DecidedAt = &d
+	}
+	if len(r.Contacts) > 0 {
+		cp.Contacts = make([]Contact, len(r.Contacts))
+		copy(cp.Contacts, r.Contacts)
+	}
+	if len(r.RequiredRoles) > 0 {
+		cp.RequiredRoles = append([]ContactRole(nil), r.RequiredRoles...)
 	}
 	return &cp
 }

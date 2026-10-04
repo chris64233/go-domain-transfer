@@ -164,56 +164,11 @@ func (s *Service) ConfigureContacts(domain, ownerID string, contacts []ContactSp
 		// 注意：转移进行中（域名锁定）仍允许修改“当前”联系人资料；
 		// 已创建的转移持有冻结快照，门槛不受影响。
 
-		// 规范化并校验联系人。
-		newContacts := make(map[string]*Contact, len(contacts))
-		for _, c := range contacts {
-			if c.ID == "" || c.Name == "" || c.Email == "" || c.Credential == "" {
-				return fmt.Errorf("%w: contact id, name, email and credential are required", ErrInvalidInput)
-			}
-			if !validRole(c.Role) {
-				return fmt.Errorf("%w: unsupported contact role %q", ErrInvalidInput, c.Role)
-			}
-			if _, dup := newContacts[c.ID]; dup {
-				return fmt.Errorf("%w: duplicate contact id %q", ErrInvalidInput, c.ID)
-			}
-			newContacts[c.ID] = &Contact{
-				ID:              c.ID,
-				Role:            c.Role,
-				Name:            c.Name,
-				Email:           c.Email,
-				CredentialHash:  credentialDigest(c.ID, c.Credential),
-				CredentialSetAt: now,
-			}
+		newContacts, snapshot, roles, lapse, err := s.normalizeContactConfig(contacts, requiredRoles, roundLapse, now)
+		if err != nil {
+			return err
 		}
 
-		// 规范化并校验所需角色组合。
-		roles := normalizeRoles(requiredRoles)
-		if len(roles) == 0 {
-			return fmt.Errorf("%w: required roles must not be empty", ErrInvalidInput)
-		}
-		roleCovered := map[ContactRole]bool{}
-		for _, c := range newContacts {
-			roleCovered[c.Role] = true
-		}
-		for _, r := range roles {
-			if !roleCovered[r] {
-				return fmt.Errorf("%w: no contact configured for required role %q", ErrInvalidInput, r)
-			}
-		}
-
-		lapse := roundLapse
-		if lapse <= 0 {
-			lapse = s.contactRoundLapse
-		}
-		if lapse <= 0 {
-			return fmt.Errorf("%w: contact round lapse must be positive", ErrInvalidInput)
-		}
-
-		// 冻结联系人快照（值拷贝）写入实时策略；转移创建时再整体深拷贝。
-		snapshot := make([]Contact, 0, len(newContacts))
-		for _, c := range newContacts {
-			snapshot = append(snapshot, *c)
-		}
 		d.Contacts = newContacts
 		d.Approval = &ApprovalPolicy{
 			RequiredRoles: roles,
@@ -222,10 +177,69 @@ func (s *Service) ConfigureContacts(domain, ownerID string, contacts []ContactSp
 			RequireAll:    requireAll,
 		}
 		d.Version++
+		// 资料再次修改：指向旧版本的待审批变更申请明确变为不可继续处理。
+		supersedePendingChangesLocked(st, domain, "", now)
 		appendAudit(st, now, "contacts_configured", domain, "", ownerID,
 			fmt.Sprintf("roles=%s require_all=%t round_lapse=%s", joinRoles(roles), requireAll, lapse))
 		return nil
 	})
+}
+
+// normalizeContactConfig 校验并规范化联系人配置：明文凭据立即转为摘要，
+// 返回按 ID 的联系人 map、按 ID 排序的快照、去重后的所需角色与生效的单轮期限。
+func (s *Service) normalizeContactConfig(contacts []ContactSpec, requiredRoles []ContactRole, roundLapse time.Duration, now time.Time) (map[string]*Contact, []Contact, []ContactRole, time.Duration, error) {
+	if len(contacts) == 0 {
+		return nil, nil, nil, 0, fmt.Errorf("%w: at least one contact is required", ErrInvalidInput)
+	}
+	newContacts := make(map[string]*Contact, len(contacts))
+	for _, c := range contacts {
+		if c.ID == "" || c.Name == "" || c.Email == "" || c.Credential == "" {
+			return nil, nil, nil, 0, fmt.Errorf("%w: contact id, name, email and credential are required", ErrInvalidInput)
+		}
+		if !validRole(c.Role) {
+			return nil, nil, nil, 0, fmt.Errorf("%w: unsupported contact role %q", ErrInvalidInput, c.Role)
+		}
+		if _, dup := newContacts[c.ID]; dup {
+			return nil, nil, nil, 0, fmt.Errorf("%w: duplicate contact id %q", ErrInvalidInput, c.ID)
+		}
+		newContacts[c.ID] = &Contact{
+			ID:              c.ID,
+			Role:            c.Role,
+			Name:            c.Name,
+			Email:           c.Email,
+			CredentialHash:  credentialDigest(c.ID, c.Credential),
+			CredentialSetAt: now,
+		}
+	}
+
+	roles := normalizeRoles(requiredRoles)
+	if len(roles) == 0 {
+		return nil, nil, nil, 0, fmt.Errorf("%w: required roles must not be empty", ErrInvalidInput)
+	}
+	roleCovered := map[ContactRole]bool{}
+	for _, c := range newContacts {
+		roleCovered[c.Role] = true
+	}
+	for _, r := range roles {
+		if !roleCovered[r] {
+			return nil, nil, nil, 0, fmt.Errorf("%w: no contact configured for required role %q", ErrInvalidInput, r)
+		}
+	}
+
+	lapse := roundLapse
+	if lapse <= 0 {
+		lapse = s.contactRoundLapse
+	}
+	if lapse <= 0 {
+		return nil, nil, nil, 0, fmt.Errorf("%w: contact round lapse must be positive", ErrInvalidInput)
+	}
+
+	snapshot := make([]Contact, 0, len(newContacts))
+	for _, c := range newContacts {
+		snapshot = append(snapshot, *c)
+	}
+	sort.Slice(snapshot, func(i, j int) bool { return snapshot[i].ID < snapshot[j].ID })
+	return newContacts, snapshot, roles, lapse, nil
 }
 
 // GenerateAuthCode 为域名所有者生成一次性短期授权码。
@@ -323,6 +337,8 @@ func (s *Service) InitiateTransfer(externalRef, domain, code, actor string) (*Tr
 		rec.ConsumedAt = &consumed
 		d.Locked = true
 		d.Version++
+		// 域名锁定：指向旧版本的待审批变更申请明确变为不可继续处理。
+		supersedePendingChangesLocked(st, domain, "", now)
 
 		t := &Transfer{
 			ID:            newTransferID(st),
@@ -655,6 +671,219 @@ func (s *Service) GetApprovalPolicy(transferID string) (*ApprovalPolicy, error) 
 	return out, nil
 }
 
+// SubmitContactChange 提交一笔联系人变更申请。申请冻结新联系人快照（明文凭据
+// 立即转摘要，绝不持久化）与提交时看到的域名资料版本；此后原联系人资料如何变化，
+// 都不改变待审批内容。requestRef 为幂等键：同号同内容（资料、域名、申请人与版本
+// 均一致）返回原记录，任一变化返回 ErrChangeRequestConflict。
+func (s *Service) SubmitContactChange(requestRef, domain, requesterID string, contacts []ContactSpec, requiredRoles []ContactRole, requireAll bool, roundLapse time.Duration) (*ContactChangeRequest, error) {
+	if requestRef == "" || domain == "" || requesterID == "" {
+		return nil, fmt.Errorf("%w: request ref, domain and requester are required", ErrInvalidInput)
+	}
+	now := s.now()
+	_, snapshot, roles, lapse, err := s.normalizeContactConfig(contacts, requiredRoles, roundLapse, now)
+	if err != nil {
+		return nil, err
+	}
+	var result *ContactChangeRequest
+	err = s.store.transact(func(st *state) error {
+		d, ok := st.Domains[domain]
+		if !ok {
+			return ErrDomainNotFound
+		}
+		// 幂等：申请号已存在时按内容判重。域名资料版本已推进（即审批版本变化）
+		// 同样视为冲突，防止把旧申请号套到新资料版本上。
+		if id, ok := st.ChangeByRef[requestRef]; ok {
+			existing := st.ChangeRequests[id]
+			if existing.Domain == domain && existing.RequesterID == requesterID &&
+				existing.BaseVersion == d.Version &&
+				changeContentEqual(existing, snapshot, roles, requireAll, lapse) {
+				result = cloneChangeRequest(existing)
+				return nil
+			}
+			return ErrChangeRequestConflict
+		}
+		req := &ContactChangeRequest{
+			ID:            newChangeRequestID(st),
+			RequestRef:    requestRef,
+			Domain:        domain,
+			RequesterID:   requesterID,
+			BaseVersion:   d.Version,
+			Contacts:      snapshot,
+			RequiredRoles: roles,
+			RequireAll:    requireAll,
+			RoundLapse:    lapse,
+			Status:        ChangePending,
+			CreatedAt:     now,
+		}
+		st.ChangeRequests[req.ID] = req
+		st.ChangeByRef[requestRef] = req.ID
+		appendAudit(st, now, "contact_change_submitted", domain, "", requesterID,
+			fmt.Sprintf("request=%s base_version=%d", req.ID, req.BaseVersion))
+		result = cloneChangeRequest(req)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// DecideContactChange 由域名所有者审批一笔联系人变更申请。
+// 审批只能作用于当前未完成且版本一致的申请：域名锁定、转移完成或资料再次修改
+// 都会使旧申请被取代（ErrChangeRequestStale），迟到的旧审批不得回写。
+// 审批通过与联系人写入处于同一原子边界：写入失败时审批结果与域名资料都不变。
+func (s *Service) DecideContactChange(requestID, actor string, approve bool, reason string) (*ContactChangeRequest, error) {
+	if requestID == "" || actor == "" {
+		return nil, fmt.Errorf("%w: request id and actor are required", ErrInvalidInput)
+	}
+	now := s.now()
+	var result *ContactChangeRequest
+	err := s.store.transact(func(st *state) error {
+		req, ok := st.ChangeRequests[requestID]
+		if !ok {
+			return ErrChangeRequestNotFound
+		}
+		if req.Status == ChangeSuperseded {
+			return ErrChangeRequestStale
+		}
+		if req.Status.Terminal() {
+			return ErrChangeRequestNotPending
+		}
+		d, ok := st.Domains[req.Domain]
+		if !ok {
+			return ErrDomainNotFound
+		}
+		if d.OwnerID != actor {
+			return ErrNotDomainOwner
+		}
+		// 防御性版本校验：域名锁定或版本已推进时，旧申请不得继续处理。
+		if d.Locked || d.Version != req.BaseVersion {
+			supersedeLocked(st, req, now)
+			return ErrChangeRequestStale
+		}
+
+		req.DecidedAt = &now
+		req.DecidedBy = actor
+		req.Reason = reason
+		if !approve {
+			req.Status = ChangeRejected
+			emitChangeOutbox(st, req, now, "contact_change.rejected")
+			appendAudit(st, now, "contact_change_rejected", req.Domain, "", actor, "request="+req.ID)
+			result = cloneChangeRequest(req)
+			return nil
+		}
+
+		// 同一原子边界：写入新联系人资料 + 推进版本 + 落审批结果。
+		// 持久化失败时整体回滚，审批结果与域名资料不会只更新一边。
+		newContacts := make(map[string]*Contact, len(req.Contacts))
+		for i := range req.Contacts {
+			c := req.Contacts[i]
+			newContacts[c.ID] = &c
+		}
+		d.Contacts = newContacts
+		d.Approval = &ApprovalPolicy{
+			RequiredRoles: append([]ContactRole(nil), req.RequiredRoles...),
+			Contacts:      append([]Contact(nil), req.Contacts...),
+			RoundLapse:    req.RoundLapse,
+			RequireAll:    req.RequireAll,
+		}
+		d.Version++
+		req.Status = ChangeApproved
+		// 一个域名只留一个有效联系人版本：同域其他待审批申请随之失效。
+		supersedePendingChangesLocked(st, req.Domain, req.ID, now)
+		emitChangeOutbox(st, req, now, "contact_change.approved")
+		appendAudit(st, now, "contact_change_approved", req.Domain, "", actor,
+			fmt.Sprintf("request=%s new_version=%d", req.ID, d.Version))
+		result = cloneChangeRequest(req)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// GetContactChange 按内部 ID 查询联系人变更申请。
+func (s *Service) GetContactChange(id string) (*ContactChangeRequest, error) {
+	var out *ContactChangeRequest
+	s.store.view(func(st *state) {
+		if r, ok := st.ChangeRequests[id]; ok {
+			out = cloneChangeRequest(r)
+		}
+	})
+	if out == nil {
+		return nil, ErrChangeRequestNotFound
+	}
+	return out, nil
+}
+
+// GetContactChangeByRef 按申请号查询联系人变更申请。
+func (s *Service) GetContactChangeByRef(requestRef string) (*ContactChangeRequest, error) {
+	var out *ContactChangeRequest
+	s.store.view(func(st *state) {
+		if id, ok := st.ChangeByRef[requestRef]; ok {
+			if r, ok := st.ChangeRequests[id]; ok {
+				out = cloneChangeRequest(r)
+			}
+		}
+	})
+	if out == nil {
+		return nil, ErrChangeRequestNotFound
+	}
+	return out, nil
+}
+
+// supersedePendingChangesLocked 将指定域名全部待审批的变更申请（可排除一笔）
+// 明确标记为被取代：版本失效，不可继续处理。调用方必须处于事务内。
+func supersedePendingChangesLocked(st *state, domain, exceptID string, now time.Time) {
+	for _, req := range st.ChangeRequests {
+		if req.Domain != domain || req.ID == exceptID || req.Status != ChangePending {
+			continue
+		}
+		supersedeLocked(st, req, now)
+	}
+}
+
+// supersedeLocked 将单笔变更申请落为被取代终态并留痕。
+func supersedeLocked(st *state, req *ContactChangeRequest, now time.Time) {
+	req.Status = ChangeSuperseded
+	req.DecidedAt = &now
+	req.DecidedBy = "system"
+	appendAudit(st, now, "contact_change_superseded", req.Domain, "", "system", "request="+req.ID)
+}
+
+// changeContentEqual 报告既有申请的冻结内容是否与本次提交一致（幂等判重）。
+func changeContentEqual(req *ContactChangeRequest, snapshot []Contact, roles []ContactRole, requireAll bool, lapse time.Duration) bool {
+	if req.RequireAll != requireAll || req.RoundLapse != lapse ||
+		len(req.Contacts) != len(snapshot) || len(req.RequiredRoles) != len(roles) {
+		return false
+	}
+	for i := range roles {
+		if req.RequiredRoles[i] != roles[i] {
+			return false
+		}
+	}
+	for i := range snapshot {
+		a, b := req.Contacts[i], snapshot[i]
+		if a.ID != b.ID || a.Role != b.Role || a.Name != b.Name ||
+			a.Email != b.Email || a.CredentialHash != b.CredentialHash {
+			return false
+		}
+	}
+	return true
+}
+
+// emitChangeOutbox 在事务内为变更申请终局生成唯一 ID 的 outbox 消息。
+func emitChangeOutbox(st *state, req *ContactChangeRequest, now time.Time, typ string) {
+	m := &OutboxMessage{
+		ID:        newOutboxID(st),
+		Domain:    req.Domain,
+		Type:      typ,
+		CreatedAt: now,
+	}
+	st.Outbox[m.ID] = m
+}
+
 // GetTransfer 按内部 ID 查询转移单。
 func (s *Service) GetTransfer(id string) (*Transfer, error) {
 	var out *Transfer
@@ -732,6 +961,8 @@ func approveLocked(st *state, t *Transfer, now time.Time, status TransferStatus,
 	d.Locked = false
 	d.Version++
 	delete(st.PendingByDomain, t.Domain)
+	// 转移完成：指向旧版本/旧所有者的待审批变更申请明确变为不可继续处理。
+	supersedePendingChangesLocked(st, t.Domain, "", now)
 
 	t.Status = status
 	t.DecidedAt = &now
@@ -928,6 +1159,15 @@ func newOutboxID(st *state) string {
 	for {
 		id := "ob_" + mustToken(8)
 		if _, ok := st.Outbox[id]; !ok {
+			return id
+		}
+	}
+}
+
+func newChangeRequestID(st *state) string {
+	for {
+		id := "cr_" + mustToken(8)
+		if _, ok := st.ChangeRequests[id]; !ok {
 			return id
 		}
 	}
